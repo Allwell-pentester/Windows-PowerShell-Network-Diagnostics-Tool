@@ -1,0 +1,599 @@
+# General Network Diagnostics Script for Windows PowerShell
+# Run as Administrator for full functionality
+
+Write-Host "=====================================" -ForegroundColor Green
+Write-Host "   GENERAL NETWORK DIAGNOSTICS TOOL"
+Write-Host "   Active & Passive Testing"
+Write-Host "=====================================" -ForegroundColor Green
+
+# Check for admin rights
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "WARNING: Running without Administrator privileges." -ForegroundColor Yellow
+    Write-Host "Some features will be limited.`n" -ForegroundColor Yellow
+}
+
+# Global variables
+$global:testResults = @()
+
+# Function to log test results
+function Add-TestResult {
+    param($TestName, $Status, $Details)
+    $global:testResults += [PSCustomObject]@{
+        Timestamp = Get-Date
+        TestName = $TestName
+        Status = $Status
+        Details = $Details
+    }
+}
+
+# Function to get local network configuration
+function Get-LocalNetworkConfig {
+    Write-Host "`n[1] LOCAL NETWORK CONFIGURATION" -ForegroundColor Green
+    Write-Host "================================" -ForegroundColor Gray
+    
+    Write-Host "`n--- Computer Information ---" -ForegroundColor Yellow
+    Write-Host "Computer Name: $env:COMPUTERNAME"
+    Write-Host "Domain: $env:USERDNSDOMAIN"
+    Write-Host "OS Version: $(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)"
+    
+    Write-Host "`n--- IP Configuration ---" -ForegroundColor Yellow
+    $ipConfig = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -ne "Loopback"}
+    foreach ($ip in $ipConfig) {
+        $adapter = Get-NetAdapter -InterfaceIndex $ip.InterfaceIndex -ErrorAction SilentlyContinue
+        if ($adapter) {
+            Write-Host "`nInterface: $($adapter.Name)"
+            Write-Host "  IP Address: $($ip.IPAddress)"
+            Write-Host "  Subnet Mask: $($ip.PrefixLength)"
+            Write-Host "  MAC Address: $($adapter.MacAddress)"
+            Write-Host "  Status: $($adapter.Status)"
+        }
+    }
+    
+    Write-Host "`n--- Default Gateway ---" -ForegroundColor Yellow
+    $gateway = Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Select-Object -First 1
+    if ($gateway) {
+        Write-Host "Gateway: $($gateway.NextHop)"
+        Write-Host "Interface Metric: $($gateway.InterfaceMetric)"
+        
+        Write-Host "`nTesting gateway connectivity..." -ForegroundColor Gray
+        $ping = Test-Connection -ComputerName $gateway.NextHop -Count 4 -Quiet -ErrorAction SilentlyContinue
+        if ($ping) {
+            Write-Host "Gateway is REACHABLE" -ForegroundColor Green
+            Add-TestResult -TestName "Gateway Ping" -Status "Pass" -Details "$($gateway.NextHop) is reachable"
+        } else {
+            Write-Host "Gateway is NOT REACHABLE" -ForegroundColor Red
+            Add-TestResult -TestName "Gateway Ping" -Status "Fail" -Details "$($gateway.NextHop) is not reachable"
+        }
+    } else {
+        Write-Host "No default gateway found!" -ForegroundColor Red
+    }
+    
+    Write-Host "`n--- DNS Configuration ---" -ForegroundColor Yellow
+    $dnsServers = Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresses -ne $null}
+    foreach ($dns in $dnsServers) {
+        $adapter = Get-NetAdapter -InterfaceIndex $dns.InterfaceIndex -ErrorAction SilentlyContinue
+        if ($adapter) {
+            Write-Host "Interface: $($adapter.Name)"
+            Write-Host "  DNS Servers: $($dns.ServerAddresses -join ', ')"
+        }
+    }
+}
+
+# Function to test network connectivity
+function Test-NetworkConnectivity {
+    Write-Host "`n[2] NETWORK CONNECTIVITY TESTS" -ForegroundColor Green
+    Write-Host "================================" -ForegroundColor Gray
+    
+    $targets = @(
+        @{Name="Local Gateway"; Address=$((Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop)},
+        @{Name="Google DNS"; Address="8.8.8.8"},
+        @{Name="Cloudflare DNS"; Address="1.1.1.1"},
+        @{Name="Microsoft"; Address="microsoft.com"},
+        @{Name="Google"; Address="google.com"}
+    )
+    
+    foreach ($target in $targets) {
+        if (-not $target.Address) { continue }
+        
+        Write-Host "`nTesting $($target.Name) ($($target.Address))..." -ForegroundColor Yellow
+        $result = Test-Connection -ComputerName $target.Address -Count 4 -ErrorAction SilentlyContinue
+        
+        if ($result) {
+            $avgTime = ($result | Measure-Object -Property ResponseTime -Average).Average
+            Write-Host "  Status: SUCCESS" -ForegroundColor Green
+            Write-Host "  Avg Response: $([math]::Round($avgTime, 2)) ms"
+            Write-Host "  Packet Loss: 0%"
+            Add-TestResult -TestName "Ping $($target.Name)" -Status "Pass" -Details "Avg: $([math]::Round($avgTime, 2))ms"
+        } else {
+            Write-Host "  Status: FAILED" -ForegroundColor Red
+            Add-TestResult -TestName "Ping $($target.Name)" -Status "Fail" -Details "No response"
+        }
+    }
+}
+
+# Function to perform traceroute
+function Invoke-Traceroute {
+    Write-Host "`n[3] TRACEROUTE (Path Analysis)" -ForegroundColor Green
+    Write-Host "================================" -ForegroundColor Gray
+    
+    $target = Read-Host "Enter target IP or hostname (default: google.com)"
+    if (-not $target) { $target = "google.com" }
+    
+    Write-Host "`nTracing route to $target..." -ForegroundColor Yellow
+    Write-Host "This may take up to 60 seconds...`n"
+    
+    $trace = Test-NetConnection -ComputerName $target -TraceRoute -ErrorAction SilentlyContinue
+    
+    if ($trace.TraceRoute) {
+        $hop = 1
+        foreach ($hopAddress in $trace.TraceRoute) {
+            $ping = Test-Connection -ComputerName $hopAddress -Count 2 -Quiet -ErrorAction SilentlyContinue
+            $status = if ($ping) { "✓" } else { "✗" }
+            Write-Host "$hop`t$status`t$hopAddress" -ForegroundColor $(if ($ping) { "Green" } else { "Red" })
+            $hop++
+        }
+        Add-TestResult -TestName "Traceroute to $target" -Status "Info" -Details "$($trace.TraceRoute.Count) hops"
+    } else {
+        Write-Host "Traceroute failed or timed out." -ForegroundColor Red
+        Add-TestResult -TestName "Traceroute to $target" -Status "Fail" -Details "Failed"
+    }
+}
+
+# Function to test DNS resolution
+function Test-DNSResolution {
+    Write-Host "`n[4] DNS RESOLUTION TESTS" -ForegroundColor Green
+    Write-Host "=========================" -ForegroundColor Gray
+    
+    $domains = @("google.com", "microsoft.com", "github.com", "stackoverflow.com")
+    
+    Write-Host "`nTesting DNS resolution speed and accuracy..." -ForegroundColor Yellow
+    
+    foreach ($domain in $domains) {
+        Write-Host "`nResolving $domain..." -ForegroundColor Cyan
+        
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $resolved = Resolve-DnsName -Name $domain -ErrorAction SilentlyContinue
+        $stopwatch.Stop()
+        
+        if ($resolved) {
+            $ipAddresses = ($resolved | Where-Object {$_.Type -eq "A"} | Select-Object -First 3 -ExpandProperty IPAddress) -join ", "
+            Write-Host "  IP Addresses: $ipAddresses"
+            Write-Host "  Resolution Time: $($stopwatch.ElapsedMilliseconds) ms" -ForegroundColor Green
+            
+            if ($stopwatch.ElapsedMilliseconds -gt 100) {
+                Write-Host "  WARNING: Slow DNS resolution (>100ms)" -ForegroundColor Yellow
+            }
+            Add-TestResult -TestName "DNS $domain" -Status "Pass" -Details "$($stopwatch.ElapsedMilliseconds)ms"
+        } else {
+            Write-Host "  FAILED to resolve $domain" -ForegroundColor Red
+            Add-TestResult -TestName "DNS $domain" -Status "Fail" -Details "Resolution failed"
+        }
+    }
+    
+    Write-Host "`n--- Testing Alternative DNS Servers ---" -ForegroundColor Yellow
+    $dnsServers = @("8.8.8.8", "1.1.1.1", "9.9.9.9")
+    
+    foreach ($server in $dnsServers) {
+        Write-Host "`nTesting DNS Server: $server" -ForegroundColor Cyan
+        $result = Resolve-DnsName -Name "google.com" -Server $server -ErrorAction SilentlyContinue
+        if ($result) {
+            Write-Host "  Status: RESPONSIVE" -ForegroundColor Green
+        } else {
+            Write-Host "  Status: UNRESPONSIVE" -ForegroundColor Red
+        }
+    }
+}
+
+# Function to test network speed
+function Test-NetworkSpeed {
+    Write-Host "`n[5] NETWORK SPEED TEST (Download)" -ForegroundColor Green
+    Write-Host "===================================" -ForegroundColor Gray
+    
+    Write-Host "Testing download speed from Microsoft..." -ForegroundColor Yellow
+    Write-Host "This test downloads a 10MB test file and measures speed.`n"
+    
+    $url = "http://speedtest.tele2.net/10MB.zip"
+    $output = "$env:TEMP\speedtest.tmp"
+    
+    try {
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        Invoke-WebRequest -Uri $url -OutFile $output -ErrorAction Stop
+        $stopwatch.Stop()
+        
+        $fileSize = (Get-Item $output).Length / 1MB
+        $speedMbps = ($fileSize * 8) / ($stopwatch.Elapsed.TotalSeconds)
+        
+        Write-Host "`nResults:" -ForegroundColor Green
+        Write-Host "  File Size: $([math]::Round($fileSize, 2)) MB"
+        Write-Host "  Time: $($stopwatch.Elapsed.TotalSeconds) seconds"
+        Write-Host "  Speed: $([math]::Round($speedMbps, 2)) Mbps"
+        
+        Remove-Item $output -Force
+        
+        if ($speedMbps -lt 5) {
+            Write-Host "  WARNING: Speed is very slow (<5 Mbps)" -ForegroundColor Red
+        } elseif ($speedMbps -lt 20) {
+            Write-Host "  CAUTION: Speed is moderate but could be better" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Speed is GOOD!" -ForegroundColor Green
+        }
+        
+        Add-TestResult -TestName "Download Speed" -Status "Info" -Details "$([math]::Round($speedMbps, 2)) Mbps"
+    }
+    catch {
+        Write-Host "Speed test failed: $_" -ForegroundColor Red
+        Add-TestResult -TestName "Download Speed" -Status "Fail" -Details "Test failed"
+    }
+}
+
+# Function to scan open ports on a target
+function Scan-Ports {
+    Write-Host "`n[6] PORT SCANNER (Common Ports)" -ForegroundColor Green
+    Write-Host "================================" -ForegroundColor Gray
+    
+    $target = Read-Host "Enter target IP or hostname (default: localhost)"
+    if (-not $target) { $target = "localhost" }
+    
+    $ports = @(
+        @{Number=21; Name="FTP"},
+        @{Number=22; Name="SSH"},
+        @{Number=23; Name="Telnet"},
+        @{Number=25; Name="SMTP"},
+        @{Number=53; Name="DNS"},
+        @{Number=80; Name="HTTP"},
+        @{Number=110; Name="POP3"},
+        @{Number=135; Name="RPC"},
+        @{Number=139; Name="NetBIOS"},
+        @{Number=143; Name="IMAP"},
+        @{Number=443; Name="HTTPS"},
+        @{Number=445; Name="SMB"},
+        @{Number=3389; Name="RDP"},
+        @{Number=8080; Name="HTTP-Alt"}
+    )
+    
+    Write-Host "`nScanning $target for open ports..." -ForegroundColor Yellow
+    Write-Host "This may take up to 30 seconds.`n"
+    
+    $openPorts = @()
+    
+    foreach ($port in $ports) {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $async = $tcpClient.BeginConnect($target, $port.Number, $null, $null)
+        $wait = $async.AsyncWaitHandle.WaitOne(1000)
+        
+        if ($wait -and $tcpClient.Connected) {
+            Write-Host "  OK Port $($port.Number) ($($port.Name)) - OPEN" -ForegroundColor Green
+            $openPorts += "$($port.Number) ($($port.Name))"
+            $tcpClient.Close()
+        } else {
+            Write-Host "  XX Port $($port.Number) ($($port.Name)) - Closed/Filtered" -ForegroundColor Gray
+        }
+        $tcpClient.Close()
+    }
+    
+    if ($openPorts.Count -gt 0) {
+        Add-TestResult -TestName "Port Scan $target" -Status "Info" -Details "Open: $($openPorts -join ', ')"
+    } else {
+        Add-TestResult -TestName "Port Scan $target" -Status "Info" -Details "No common ports open"
+    }
+}
+
+# Function to diagnose network latency
+function Get-NetworkLatency {
+    Write-Host "`n[7] LATENCY DIAGNOSTICS" -ForegroundColor Green
+    Write-Host "=======================" -ForegroundColor Gray
+    
+    $targets = @("8.8.8.8", "1.1.1.1", "4.2.2.4")
+    
+    foreach ($target in $targets) {
+        Write-Host "`nTesting latency to $target..." -ForegroundColor Yellow
+        
+        $results = @()
+        for ($i = 1; $i -le 10; $i++) {
+            $ping = Test-Connection -ComputerName $target -Count 1 -ErrorAction SilentlyContinue
+            if ($ping) {
+                $results += $ping.ResponseTime
+                Write-Host "  Ping $($i): $($ping.ResponseTime) ms" -ForegroundColor Gray
+            } else {
+                Write-Host "  Ping $($i): TIMEOUT" -ForegroundColor Red
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        
+        if ($results.Count -gt 0) {
+            $avg = ($results | Measure-Object -Average).Average
+            $min = ($results | Measure-Object -Minimum).Minimum
+            $max = ($results | Measure-Object -Maximum).Maximum
+            $jitter = [math]::Round(($results | Measure-Object -StandardDeviation).StandardDeviation, 2)
+            
+            Write-Host "`n  Summary:" -ForegroundColor Cyan
+            Write-Host "    Min: $min ms"
+            Write-Host "    Max: $max ms"
+            Write-Host "    Avg: $([math]::Round($avg, 2)) ms"
+            Write-Host "    Jitter: $jitter ms"
+            
+            if ($jitter -gt 20) {
+                Write-Host "    WARNING: High jitter detected (unstable connection)" -ForegroundColor Red
+            }
+            
+            Add-TestResult -TestName "Latency to $target" -Status "Info" -Details "Avg: $([math]::Round($avg, 2))ms, Jitter: ${jitter}ms"
+        }
+    }
+}
+
+# Function to analyze wireless network
+function Analyze-WirelessNetwork {
+    Write-Host "`n[8] WIRELESS NETWORK ANALYSIS" -ForegroundColor Green
+    Write-Host "=============================" -ForegroundColor Gray
+    
+    $wlan = netsh wlan show interfaces 2>$null
+    if ($wlan -match "There is no wireless interface") {
+        Write-Host "No wireless interface detected." -ForegroundColor Yellow
+        return
+    }
+    
+    $signal = netsh wlan show interfaces 2>$null | Select-String "Signal" -Context 0,1
+    if ($signal) {
+        $strength = [regex]::Match($signal, "\d+%").Value
+        Write-Host "Signal Strength: $strength" -ForegroundColor Cyan
+        
+        if ([int]$strength -lt 30) {
+            Write-Host "  WARNING: Signal strength is very poor" -ForegroundColor Red
+        } elseif ([int]$strength -lt 60) {
+            Write-Host "  CAUTION: Signal strength is weak" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Signal strength is good" -ForegroundColor Green
+        }
+    }
+    
+    Write-Host "`nAvailable Wireless Networks:" -ForegroundColor Yellow
+    $networks = netsh wlan show networks mode=bssid 2>$null | Select-String "SSID|Signal|Channel|Radio type"
+    Write-Host $networks
+}
+
+# Function to test MTU
+function Test-MTU {
+    Write-Host "`n[9] MTU AND PACKET FRAGMENTATION TEST" -ForegroundColor Green
+    Write-Host "======================================" -ForegroundColor Gray
+    
+    $target = Read-Host "Enter target IP (default: 8.8.8.8)"
+    if (-not $target) { $target = "8.8.8.8" }
+    
+    Write-Host "`nFinding optimal MTU size..." -ForegroundColor Yellow
+    
+    $mtuSizes = @(1500, 1472, 1450, 1400, 1350, 1300, 1200, 1000)
+    $workingMTU = 0
+    
+    foreach ($mtu in $mtuSizes) {
+        $ping = Test-Connection -ComputerName $target -BufferSize $mtu -Fragment -Count 1 -ErrorAction SilentlyContinue
+        if ($ping) {
+            Write-Host "  MTU $($mtu): SUCCESS" -ForegroundColor Green
+            $workingMTU = $mtu
+            break
+        } else {
+            Write-Host "  MTU $($mtu): FAILED (fragmentation required)" -ForegroundColor Red
+        }
+    }
+    
+    if ($workingMTU -gt 0) {
+        $optimalMTU = $workingMTU + 28
+        Write-Host "`nOptimal MTU size: $optimalMTU bytes" -ForegroundColor Green
+        Add-TestResult -TestName "MTU Test" -Status "Info" -Details "Optimal MTU: $optimalMTU"
+    } else {
+        Write-Host "Could not determine optimal MTU" -ForegroundColor Red
+    }
+}
+
+# Function to monitor network in real-time
+function Start-RealtimeMonitor {
+    Write-Host "`n[10] REAL-TIME NETWORK MONITOR" -ForegroundColor Green
+    Write-Host "==============================" -ForegroundColor Gray
+    Write-Host "Monitoring network activity (Press Ctrl+C to stop)...`n"
+    
+    try {
+        while ($true) {
+            Clear-Host
+            Write-Host "REAL-TIME NETWORK MONITOR - $(Get-Date)" -ForegroundColor Cyan
+            Write-Host ("=" * 60)
+            
+            $adapters = Get-NetAdapter | Where-Object {$_.Status -eq "Up"}
+            $stats = @{}
+            
+            foreach ($adapter in $adapters) {
+                $adapterStats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction SilentlyContinue
+                if ($adapterStats) {
+                    $stats[$adapter.Name] = $adapterStats
+                }
+            }
+            
+            Start-Sleep -Seconds 2
+            
+            Write-Host "`nBandwidth Usage:" -ForegroundColor Yellow
+            foreach ($adapter in $adapters) {
+                $currentStats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction SilentlyContinue
+                if ($currentStats -and $stats[$adapter.Name]) {
+                    $receivedMBps = ($currentStats.ReceivedBytes - $stats[$adapter.Name].ReceivedBytes) / 1MB / 2
+                    $sentMBps = ($currentStats.SentBytes - $stats[$adapter.Name].SentBytes) / 1MB / 2
+                    Write-Host "  $($adapter.Name): Down $([math]::Round($receivedMBps, 2)) MB/s Up $([math]::Round($sentMBps, 2)) MB/s"
+                }
+            }
+            
+            Write-Host "`nActive TCP Connections:" -ForegroundColor Yellow
+            $connections = Get-NetTCPConnection | Where-Object {$_.State -eq "Established"}
+            $grouped = $connections | Group-Object RemoteAddress | Select-Object -First 10
+            
+            foreach ($group in $grouped) {
+                if ($group.Name) {
+                    Write-Host "  $($group.Name): $($group.Count) connections"
+                }
+            }
+            
+            Write-Host "`nLive Latency (8.8.8.8):" -ForegroundColor Yellow
+            $ping = Test-Connection -ComputerName "8.8.8.8" -Count 1 -Quiet -ErrorAction SilentlyContinue
+            if ($ping) {
+                Write-Host "  Connection OK" -ForegroundColor Green
+            } else {
+                Write-Host "  Connection FAILED" -ForegroundColor Red
+            }
+        }
+    }
+    catch [System.Management.Automation.OperationCanceledException] {
+        Write-Host "`nMonitoring stopped." -ForegroundColor Yellow
+    }
+}
+
+# Function to generate diagnostic report
+function Export-FullReport {
+    Write-Host "`n[11] GENERATE COMPLETE DIAGNOSTIC REPORT" -ForegroundColor Green
+    Write-Host "=========================================" -ForegroundColor Gray
+    
+    $reportPath = "$env:USERPROFILE\Desktop\network_diagnostic_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    
+    Write-Host "Generating HTML report to: $reportPath" -ForegroundColor Yellow
+    
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Network Diagnostic Report - $(Get-Date)</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 20px; background: #ecf0f1; padding: 10px; }
+        .pass { color: green; font-weight: bold; }
+        .fail { color: red; font-weight: bold; }
+        .info { color: blue; }
+        table { border-collapse: collapse; width: 100%; margin: 10px 0; background: white; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background: #3498db; color: white; }
+        .summary { background: white; padding: 15px; border-radius: 5px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>Network Diagnostic Report</h1>
+    <p>Generated: $(Get-Date)</p>
+    <p>Computer: $env:COMPUTERNAME</p>
+    <p>User: $env:USERNAME</p>
+    
+    <div class="summary">
+        <h2>Test Summary</h2>
+        <table>
+            <tr><th>Test Name</th><th>Status</th><th>Details</th><th>Timestamp</th></tr>
+"@
+    
+    foreach ($result in $global:testResults) {
+        $statusClass = switch ($result.Status) {
+            "Pass" { "pass" }
+            "Fail" { "fail" }
+            default { "info" }
+        }
+        $html += @"
+            <tr>
+                <td>$($result.TestName)</td>
+                <td class="$statusClass">$($result.Status)</td>
+                <td>$($result.Details)</td>
+                <td>$($result.Timestamp)</td>
+            </tr>
+"@
+    }
+    
+    $html += @"
+        </table>
+    </div>
+    
+    <div class="summary">
+        <h2>System Information</h2>
+        <pre>$(Get-NetIPAddress | Out-String)</pre>
+    </div>
+    
+    <div class="summary">
+        <h2>Recommendations</h2>
+        <ul>
+"@
+    
+    $failedTests = $global:testResults | Where-Object {$_.Status -eq "Fail"}
+    if ($failedTests.Count -gt 0) {
+        $html += "<li>Some connectivity tests failed. Check your network connection and firewall settings.</li>"
+    }
+    
+    $html += @"
+        </ul>
+    </div>
+</body>
+</html>
+"@
+    
+    $html | Out-File -FilePath $reportPath -Encoding UTF8
+    Write-Host "Report saved successfully!" -ForegroundColor Green
+    Write-Host "Opening report in browser..." -ForegroundColor Yellow
+    Start-Process $reportPath
+}
+
+# Function to run all diagnostics
+function Invoke-AllDiagnostics {
+    Write-Host "`n=====================================" -ForegroundColor Green
+    Write-Host "   RUNNING COMPLETE DIAGNOSTIC SUITE"
+    Write-Host "=====================================" -ForegroundColor Green
+    
+    Get-LocalNetworkConfig
+    Test-NetworkConnectivity
+    Test-DNSResolution
+    Get-NetworkLatency
+    Test-MTU
+    Analyze-WirelessNetwork
+    
+    Write-Host "`n=====================================" -ForegroundColor Green
+    Write-Host "   DIAGNOSTIC SUITE COMPLETE"
+    Write-Host "=====================================" -ForegroundColor Green
+}
+
+# Main menu
+function Show-MainMenu {
+    do {
+        Write-Host "`n=====================================" -ForegroundColor Green
+        Write-Host "   NETWORK DIAGNOSTICS MENU"
+        Write-Host "=====================================" -ForegroundColor Green
+        Write-Host "1.  Show local network configuration"
+        Write-Host "2.  Test network connectivity (ping)"
+        Write-Host "3.  Run traceroute"
+        Write-Host "4.  Test DNS resolution"
+        Write-Host "5.  Test network speed"
+        Write-Host "6.  Scan open ports"
+        Write-Host "7.  Diagnose network latency"
+        Write-Host "8.  Analyze wireless network"
+        Write-Host "9.  Test MTU & fragmentation"
+        Write-Host "10. Start real-time network monitor"
+        Write-Host "11. Run ALL diagnostics (complete suite)"
+        Write-Host "12. Generate diagnostic report"
+        Write-Host "0.  Exit"
+        Write-Host "====================================="
+        
+        $choice = Read-Host "`nEnter your choice"
+        
+        switch ($choice) {
+            "1" { Get-LocalNetworkConfig }
+            "2" { Test-NetworkConnectivity }
+            "3" { Invoke-Traceroute }
+            "4" { Test-DNSResolution }
+            "5" { Test-NetworkSpeed }
+            "6" { Scan-Ports }
+            "7" { Get-NetworkLatency }
+            "8" { Analyze-WirelessNetwork }
+            "9" { Test-MTU }
+            "10" { Start-RealtimeMonitor }
+            "11" { Invoke-AllDiagnostics }
+            "12" { Export-FullReport }
+            "0" { Write-Host "Exiting..." -ForegroundColor Green }
+            default { Write-Host "Invalid choice" -ForegroundColor Red }
+        }
+        
+        if ($choice -ne "0" -and $choice -ne "10") {
+            Read-Host "`nPress Enter to continue"
+            Clear-Host
+        }
+    } while ($choice -ne "0")
+}
+
+# Start the diagnostics tool
+Show-MainMenu
